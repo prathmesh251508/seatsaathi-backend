@@ -33,12 +33,15 @@ app.get('/', (req, res) => {
 app.get('/api/pnr/:pnr', async (req, res) => {
   const { pnr } = req.params;
   const apiKey = process.env.RAPIDAPI_KEY;
-  const apiHost = process.env.RAPIDAPI_HOST || 'irctc1.p.rapidapi.com';
+  const apiHost = process.env.RAPIDAPI_HOST || 'pnr-status-indian-railway.p.rapidapi.com';
+
+  console.log(`[PNR] Querying details for ${pnr}...`);
 
   // Path A: RapidAPI if environment key is provided in Render
   if (apiKey) {
     try {
-      const response = await fetch(`https://${apiHost}/api/v3/getPNRStatus?pnrNumber=${pnr}`, {
+      // dev2919 endpoint uses /{PNR}
+      const response = await fetch(`https://${apiHost}/${pnr}`, {
         method: 'GET',
         headers: {
           'x-rapidapi-key': apiKey,
@@ -47,24 +50,28 @@ app.get('/api/pnr/:pnr', async (req, res) => {
       });
       const result = await response.json();
 
-      if (result && (result.status === true || result.success) && result.data) {
-        const d = result.data;
+      if (result && !result.message && (result.data || result.train_name || result.train_number || result.TrainNo)) {
+        const d = result.data || result;
+        const passList = d.passenger_list || d.passengerList || d.passengers || [];
+
         return res.json({
           success: true,
           data: {
             pnr: pnr,
-            trainNumber: d.trainNumber || d.train_number,
-            trainName: d.trainName || d.train_name,
-            journeyDate: d.dateOfJourney || d.doj,
-            coachClass: d.journeyClass || d.class,
-            boardingStation: d.boardingStationCode || d.source,
-            destinationStation: d.reservationUptoCode || d.destination,
-            passengers: (d.passengerList || []).map((p, idx) => ({
+            trainNumber: d.train_number || d.trainNumber || d.TrainNo,
+            trainName: d.train_name || d.trainName || d.TrainName,
+            journeyDate: d.doj || d.dateOfJourney || d.journey_date,
+            coachClass: d.class || d.journeyClass || d.booking_class,
+            boardingStation: d.boarding_station_code || d.source || d.boardingStationCode,
+            destinationStation: d.destination_station_code || d.destination || d.reservationUptoCode,
+            passengers: passList.length > 0 ? passList.map((p, idx) => ({
               name: `Passenger ${idx + 1}`,
-              coach: p.bookingCoachId || p.currentCoachId || "B1",
-              seat: p.bookingBerthNo || p.currentBerthNo || "1",
-              berth: p.bookingBerthCode || p.currentBerthCode || "Middle Berth"
-            }))
+              coach: p.coach || p.bookingCoachId || p.currentCoachId || "B1",
+              seat: p.seat || p.berth_no || p.bookingBerthNo || p.currentBerthNo || "1",
+              berth: p.berth || p.berth_type || p.bookingBerthCode || "Middle Berth"
+            })) : [
+              { name: "Passenger 1", coach: "B1", seat: "21", berth: "Lower Berth" }
+            ]
           }
         });
       }
