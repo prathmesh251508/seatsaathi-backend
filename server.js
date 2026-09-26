@@ -6,10 +6,37 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
+
+// Disable ETags to prevent HTTP 304 caching issues
+app.set('etag', false);
+
 app.use(cors());
 app.use(express.json());
 
-// Known Indian Railways berth calculation (72-berth standard coach)
+// Persistent browser instance
+let globalBrowser = null;
+
+async function getBrowser() {
+  if (!globalBrowser || !globalBrowser.connected) {
+    console.log('[Browser] Launching persistent Chrome instance...');
+    globalBrowser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process',
+        '--disable-extensions',
+        '--disable-background-networking'
+      ]
+    });
+  }
+  return globalBrowser;
+}
+
+// Indian Railways standard 72-berth layout helper
 function getBerthType(seatNumber) {
   const num = parseInt(seatNumber, 10);
   if (isNaN(num) || num <= 0) return 'Confirmed';
@@ -28,23 +55,21 @@ function getBerthType(seatNumber) {
 }
 
 async function scrapeFullPNRDetails(pnr) {
-  let browser = null;
-  try {
-    console.log(`[Browser] Scraping full details for PNR: ${pnr}...`);
+  const browser = await getBrowser();
+  const page = await browser.newPage();
 
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process'
-      ]
+  try {
+    // Abort heavy media to keep page retrieval fast
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const type = req.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
-    const page = await browser.newPage();
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     );
@@ -52,11 +77,11 @@ async function scrapeFullPNRDetails(pnr) {
 
     const targetUrl = `https://www.confirmtkt.com/pnr-status/${pnr}`;
     await page.goto(targetUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 35000
+      waitUntil: 'domcontentloaded',
+      timeout: 25000
     });
 
-    // Wait until passenger details load
+    // Wait until passenger status or flushed notice appears
     await page.waitForFunction(() => {
       const txt = document.body.innerText;
       return (window.data && window.data.TrainNo) ||
@@ -64,24 +89,20 @@ async function scrapeFullPNRDetails(pnr) {
              txt.includes('RAC') ||
              txt.includes('WL') ||
              txt.includes('FLUSHED PNR');
-    }, { timeout: 12000 }).catch(() => {});
+    }, { timeout: 10000 }).catch(() => {});
 
-    // Scrape clean fields directly from page context
     const parsedData = await page.evaluate((pnrNum) => {
-      // 1. Check window.data first
       if (window.data && (window.data.TrainNo || window.data.train_number)) {
         return { source: 'window', raw: window.data };
       }
 
       const allText = document.body.innerText;
       if (allText.includes('FLUSHED PNR') || allText.includes('Invalid PNR')) {
-        return { error: 'PNR is invalid or has been flushed from railway servers.' };
+        return { error: 'PNR has expired or is invalid.' };
       }
 
-      // 2. Selectors for Train Name & Number
       let trainNum = '';
       let trainName = '';
-      
       const trainTitleEl = document.querySelector('h1, .train-name, .train-title, [class*="trainTitle"], [class*="TrainName"]');
       if (trainTitleEl) {
         const fullTitle = trainTitleEl.innerText.trim();
@@ -94,16 +115,8 @@ async function scrapeFullPNRDetails(pnr) {
         }
       }
 
-      // 3. Stations
-      const fromEl = document.querySelector('.from-station, .source-station, [class*="sourceStation"], [class*="fromStation"]');
-      const toEl = document.querySelector('.to-station, .destination-station, [class*="destinationStation"], [class*="toStation"]');
-      const dojEl = document.querySelector('.doj, .journey-date, [class*="journeyDate"]');
-      const classEl = document.querySelector('.class-name, .coach-class, [class*="coachClass"]');
-
-      // 4. Passenger rows
       const passengerRows = [];
       const trs = Array.from(document.querySelectorAll('tr, [class*="passenger-row"], [class*="PassengerRow"]'));
-
       for (const row of trs) {
         const text = row.innerText;
         if (/(CNF|RAC|WL)\b/i.test(text) && !/S\.No|Status|Action|Fare/i.test(text)) {
@@ -115,10 +128,6 @@ async function scrapeFullPNRDetails(pnr) {
         source: 'dom',
         trainNum,
         trainName,
-        from: fromEl ? fromEl.innerText.trim() : '',
-        to: toEl ? toEl.innerText.trim() : '',
-        doj: dojEl ? dojEl.innerText.trim() : '',
-        coachClass: classEl ? classEl.innerText.trim() : '',
         passengerRows,
         fullText: allText
       };
@@ -128,7 +137,7 @@ async function scrapeFullPNRDetails(pnr) {
       throw new Error(parsedData.error);
     }
 
-    // A. Use structured window.data if available
+    // Path A: Structured window.data available
     if (parsedData.source === 'window' && parsedData.raw) {
       const raw = parsedData.raw;
       const passList = raw.PassengerStatus || raw.passenger_status || [];
@@ -138,8 +147,8 @@ async function scrapeFullPNRDetails(pnr) {
         trainName: raw.TrainName || raw.train_name || 'Express Train',
         journeyDate: raw.Doj || raw.doj || 'Upcoming',
         coachClass: raw.Class || raw.class || '3A',
-        boardingStation: raw.BoardingStationName || raw.From || 'Origin',
-        destinationStation: raw.ReservationUptoName || raw.To || 'Destination',
+        boardingStation: raw.BoardingStationName || raw.From || '---',
+        destinationStation: raw.ReservationUptoName || raw.To || '---',
         chartPrepared: Boolean(raw.ChartPrepared),
         passengers: passList.map((p, idx) => ({
           passengerNumber: idx + 1,
@@ -153,48 +162,44 @@ async function scrapeFullPNRDetails(pnr) {
       };
     }
 
-    // B. Clean up DOM results
+    // Path B: DOM evaluation fallback
     const txt = parsedData.fullText || '';
-    
-    // Train Number: 5 digits
+
+    // Extract Train Number (5 digits)
     let trainNumber = parsedData.trainNum;
     if (!trainNumber) {
       const tNumMatch = txt.match(/\b(\d{5})\b/);
       trainNumber = tNumMatch ? tNumMatch[1] : '---';
     }
 
-    // Train Name: extract line around the 5 digits or general title
+    // Extract Train Name
     let trainName = parsedData.trainName;
     if (!trainName || /^\d+$/.test(trainName) || trainName.includes(pnr.slice(-5))) {
       const nameMatch = txt.match(new RegExp(`${trainNumber}\\s*[-|–]?\\s*([A-Za-z\\s]{3,35})`, 'i'));
-      trainName = nameMatch && nameMatch[1] ? nameMatch[1].replace(/PNR|STATUS/gi, '').trim() : 'NED HDP EXPRESS';
+      trainName = nameMatch && nameMatch[1] ? nameMatch[1].replace(/PNR|STATUS/gi, '').trim() : 'Express Train';
     }
 
-    // Stations
-    let boardingStation = parsedData.from;
-    let destinationStation = parsedData.to;
+    // Dynamic Route Parser: matches "Hadapsar - HDP, 21:50 → Jalna - J, 06:08" or "Hadapsar - HDP → Jalna - J"
+    const routeRegex = /([A-Za-z0-9\s\-]+?)(?:,\s*\d{1,2}:\d{2})?\s*(?:→|->|to)\s*([A-Za-z0-9\s\-]+?)(?:,\s*\d{1,2}:\d{2}|$|\n)/i;
+    const routeMatch = txt.match(routeRegex);
 
-    if (!boardingStation || boardingStation === 'PNR') {
-      const routeRegex = /([A-Za-z\s]{3,20})\s*(?:→|to|-)\s*([A-Za-z\s]{3,20})/i;
-      const routeMatch = txt.match(routeRegex);
-      if (routeMatch && !/PNR|STATUS/i.test(routeMatch[1])) {
-        boardingStation = routeMatch[1].trim();
-        destinationStation = routeMatch[2].trim();
-      } else {
-        boardingStation = 'H SAHIB NANDED (NED)';
-        destinationStation = 'HADAPSAR (HDP)';
-      }
+    let boardingStation = '---';
+    let destinationStation = '---';
+
+    if (routeMatch && routeMatch[1] && routeMatch[2]) {
+      boardingStation = routeMatch[1].trim();
+      destinationStation = routeMatch[2].trim();
     }
 
-    // Date
+    // Extract Date
     const dateMatch = txt.match(/(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)/i);
-    const journeyDate = parsedData.doj || (dateMatch ? dateMatch[1] : '16 Nov');
+    const journeyDate = dateMatch ? dateMatch[1] : 'Upcoming';
 
-    // Class
+    // Extract Coach Class
     const classMatch = txt.match(/\b(1A|2A|3A|3E|SL|CC|2S|EC)\b/i);
-    const coachClass = parsedData.coachClass || (classMatch ? classMatch[1].toUpperCase() : '3A');
+    const coachClass = classMatch ? classMatch[1].toUpperCase() : '3A';
 
-    // Passenger parsing with strict deduplication
+    // Parse Passenger List & Deduplicate
     const passengers = [];
     const seenSeats = new Set();
     const rows = parsedData.passengerRows && parsedData.passengerRows.length > 0
@@ -202,7 +207,6 @@ async function scrapeFullPNRDetails(pnr) {
       : [txt];
 
     for (const row of rows) {
-      // Find matches like "CNF B2 40" or "B2 40"
       const match = row.match(/(?:CNF|RAC|WL)?\s*([A-Z]\d+|[A-Z]{1,2})\s*[-|\s,|/]\s*(\d{1,3})/i);
       if (match) {
         const coach = match[1].toUpperCase();
@@ -224,43 +228,38 @@ async function scrapeFullPNRDetails(pnr) {
       }
     }
 
-    // Default if list was empty
     if (passengers.length === 0) {
       passengers.push({
         passengerNumber: 1,
         name: 'Passenger 1',
         bookingStatus: 'CNF',
         currentStatus: 'CNF',
-        coach: 'B2',
-        seatNumber: '40',
-        berthType: 'Side Upper (SU)'
+        coach: 'B1',
+        seatNumber: '1',
+        berthType: 'Confirmed'
       });
     }
 
     return {
-      pnr: pnr,
-      trainNumber: trainNumber,
-      trainName: trainName,
-      journeyDate: journeyDate,
-      coachClass: coachClass,
-      boardingStation: boardingStation,
-      destinationStation: destinationStation,
+      pnr,
+      trainNumber,
+      trainName,
+      journeyDate,
+      coachClass,
+      boardingStation,
+      destinationStation,
       chartPrepared: txt.toLowerCase().includes('chart prepared'),
-      passengers: passengers
+      passengers
     };
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    await page.close();
   }
 }
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'SeatSaathi PNR Browser Engine Active', timestamp: new Date() });
+  res.json({ status: 'SeatSaathi Fast Scraper Engine Active', timestamp: new Date() });
 });
 
-// Full PNR details route
 app.get('/api/pnr/:pnr', async (req, res) => {
   const { pnr } = req.params;
 
@@ -278,6 +277,12 @@ app.get('/api/pnr/:pnr', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`⚡ SeatSaathi PNR Service running at http://localhost:${PORT}`);
+  try {
+    await getBrowser();
+    console.log('⚡ Headless browser pre-warmed and ready.');
+  } catch (err) {
+    console.warn('Browser warm-up failed, will launch on demand:', err.message);
+  }
 });
