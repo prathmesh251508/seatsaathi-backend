@@ -1,148 +1,122 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import { 
-  configure, 
-  checkPNRStatus, 
-  getTrainInfo, 
-  trackTrain, 
-  searchTrainBetweenStations 
-} from 'railkit';
-
-dotenv.config();
-
-if (process.env.RAILKIT_API_KEY) {
-  configure(process.env.RAILKIT_API_KEY);
-}
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 1. Health check & keep-alive endpoint for UptimeRobot
-app.get('/', (req, res) => {
-  res.json({
-    status: 'SeatSaathi PNR & Train Engine Active',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString()
+// Direct Railway Gateway Scraper
+async function fetchDirectGatewayPNR(pnr) {
+  // Strategy 1: Mobile JSON Gateway
+  try {
+    const apiRes = await axios.post(
+      `https://cttrainsapi.confirmtkt.com/api/v2/ctpro/mweb/${pnr}`,
+      {},
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+          'Referer': 'https://www.confirmtkt.com/'
+        },
+        timeout: 8000
+      }
+    );
+
+    const json = apiRes.data;
+    const raw = json.data || json;
+
+    if (raw && (raw.TrainNo || raw.train_number)) {
+      const passList = raw.PassengerStatus || raw.passenger_status || [];
+      return {
+        pnr: raw.Pnr || pnr,
+        trainNumber: raw.TrainNo || raw.train_number || '',
+        trainName: raw.TrainName || raw.train_name || 'Express Train',
+        journeyDate: raw.Doj || raw.doj || 'Upcoming',
+        coachClass: raw.Class || raw.class || '3A',
+        boardingStation: raw.BoardingStationName || raw.From || raw.boarding_station || '',
+        destinationStation: raw.ReservationUptoName || raw.To || raw.destination_station || '',
+        passengers: passList.length > 0
+          ? passList.map((p, idx) => ({
+              name: `Passenger ${idx + 1}`,
+              coach: p.BookingCoachId || p.CurrentCoachId || p.coach || 'B1',
+              seat: p.BookingBerthNo || p.CurrentBerthNo || p.berth_no || `${idx + 1}`,
+              berth: p.BookingBerthCode || p.CurrentBerthCode || p.current_status || 'Confirmed'
+            }))
+          : [{ name: 'Passenger 1', coach: 'B1', seat: '1', berth: 'Confirmed' }]
+      };
+    }
+  } catch (apiErr) {
+    console.warn('[Gateway] JSON endpoint skipped, trying web parser fallback...', apiErr.message);
+  }
+
+  // Strategy 2: Web Portal Parser Fallback
+  const htmlRes = await axios.get(`https://www.confirmtkt.com/pnr-status/${pnr}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+      'Referer': 'https://www.google.com/'
+    },
+    timeout: 10000
   });
+
+  const html = htmlRes.data;
+  const match = html.match(/data\s*=\s*(\{.+?\});/s);
+
+  if (!match || !match[1]) {
+    throw new Error('Could not find live ticket data on railway servers.');
+  }
+
+  const parsed = JSON.parse(match[1]);
+  if (!parsed.TrainNo || parsed.ErrorMessage) {
+    throw new Error(parsed.ErrorMessage || 'PNR record expired or not found.');
+  }
+
+  const passList = parsed.PassengerStatus || [];
+  return {
+    pnr: parsed.Pnr || pnr,
+    trainNumber: parsed.TrainNo || '',
+    trainName: parsed.TrainName || 'Express Train',
+    journeyDate: parsed.Doj || 'Upcoming',
+    coachClass: parsed.Class || '3A',
+    boardingStation: parsed.BoardingStationName || parsed.From || '',
+    destinationStation: parsed.ReservationUptoName || parsed.To || '',
+    passengers: passList.length > 0
+      ? passList.map((p, idx) => ({
+          name: `Passenger ${idx + 1}`,
+          coach: p.BookingCoachId || p.CurrentCoachId || 'B1',
+          seat: p.BookingBerthNo || p.CurrentBerthNo || `${idx + 1}`,
+          berth: p.BookingBerthCode || p.CurrentBerthCode || 'Confirmed'
+        }))
+      : [{ name: 'Passenger 1', coach: 'B1', seat: '1', berth: 'Confirmed' }]
+  };
+}
+
+// Health Check Route
+app.get('/', (req, res) => {
+  res.json({ status: 'SeatSaathi PNR Engine Active', timestamp: new Date() });
 });
 
-// 2. Comprehensive PNR lookup
+// PNR Status Route
 app.get('/api/pnr/:pnr', async (req, res) => {
   const { pnr } = req.params;
-  const apiKey = process.env.RAPIDAPI_KEY;
-  const apiHost = process.env.RAPIDAPI_HOST || 'pnr-status-indian-railway.p.rapidapi.com';
 
-  console.log(`[PNR] Querying details for ${pnr}... (ApiKey present: ${!!apiKey})`);
-
-  // Path A: RapidAPI Live Query
-  if (apiKey) {
-    try {
-      const url = `https://${apiHost}/${pnr}`;
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'X-RapidAPI-Key': apiKey.trim(),
-          'X-RapidAPI-Host': apiHost.trim()
-        }
-      });
-
-      const result = await response.json();
-      console.log(`[RapidAPI Response for ${pnr}]:`, JSON.stringify(result));
-
-      // Check if we received a valid train record
-      if (result && !result.message && !result.error && (result.data || result.train_name || result.train_number || result.TrainNo || result.trainName)) {
-        const d = result.data || result;
-        const passList = d.passenger_list || d.passengerList || d.passengers || d.PassengerList || [];
-
-        return res.json({
-          success: true,
-          data: {
-            pnr: pnr,
-            trainNumber: d.train_number || d.trainNumber || d.TrainNo || "12001",
-            trainName: d.train_name || d.trainName || d.TrainName || "Express Train",
-            journeyDate: d.doj || d.dateOfJourney || d.journey_date || d.Doj,
-            coachClass: d.class || d.journeyClass || d.booking_class || d.Class || "3A",
-            boardingStation: d.boarding_station_code || d.source || d.boardingStationCode || d.From,
-            destinationStation: d.destination_station_code || d.destination || d.reservationUptoCode || d.To,
-            passengers: passList.length > 0 ? passList.map((p, idx) => ({
-              name: `Passenger ${idx + 1}`,
-              coach: p.coach || p.bookingCoachId || p.currentCoachId || p.Coach || "B1",
-              seat: p.seat || p.berth_no || p.bookingBerthNo || p.currentBerthNo || p.BerthNo || "21",
-              berth: p.berth || p.berth_type || p.bookingBerthCode || p.BerthType || "Confirmed"
-            })) : [
-              { name: "Passenger 1", coach: "B1", seat: "21", berth: "Confirmed" }
-            ]
-          }
-        });
-      } else if (result && result.message) {
-        console.warn(`[RapidAPI Message]: ${result.message}`);
-      }
-    } catch (rapidErr) {
-      console.warn("RapidAPI lookup error:", rapidErr.message);
-    }
+  if (!pnr || pnr.length !== 10 || isNaN(pnr)) {
+    return res.status(400).json({ error: 'PNR must be 10 numeric digits.' });
   }
 
-  // Path B: Railkit Engine Fallback
   try {
-    const result = await checkPNRStatus(pnr);
-    if (!result || !result.success) {
-      return res.status(404).json({
-        success: false,
-        message: result?.message || 'PNR details not found on IRCTC servers'
-      });
-    }
-    return res.json(result);
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to query PNR status'
-    });
+    console.log(`[PNR] Querying details for ${pnr}...`);
+    const tripData = await fetchDirectGatewayPNR(pnr);
+    return res.json(tripData);
+  } catch (err) {
+    console.error('[Error]', err.message);
+    return res.status(404).json({ error: err.message || 'Failed to retrieve PNR details from railway network.' });
   }
 });
 
-// 3. Train Route, Schedule & Intermediate Stations
-app.get('/api/train/:trainNo', async (req, res) => {
-  const { trainNo } = req.params;
-  try {
-    const result = await getTrainInfo(trainNo);
-    if (!result || !result.success) {
-      return res.status(404).json({
-        success: false,
-        message: result?.message || `Train ${trainNo} not found`
-      });
-    }
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to fetch train information'
-    });
-  }
-});
-
-// 4. Live Running Status (Train No + Date in DD-MM-YYYY)
-app.get('/api/train/:trainNo/live/:date', async (req, res) => {
-  const { trainNo, date } = req.params;
-  try {
-    const result = await trackTrain(trainNo, date);
-    if (!result || !result.success) {
-      return res.status(404).json({
-        success: false,
-        message: result?.message || 'Live tracking details unavailable'
-      });
-    }
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to track train movement'
-    });
-  }
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`⚡ SeatSaathi PNR & Train Service running on port ${PORT}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`⚡ SeatSaathi PNR Service running at http://localhost:${PORT}`);
 });
